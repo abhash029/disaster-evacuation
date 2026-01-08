@@ -1,0 +1,480 @@
+
+!pip install --quiet gradio folium requests networkx numpy ratelimit
+
+import time
+import math
+import json
+import requests
+import networkx as nx
+import folium
+import gradio as gr
+from ratelimit import limits, sleep_and_retry
+from math import radians, sin, cos, sqrt, atan2
+
+
+
+JK_BBOX = (32.0, 73.4, 35.5, 76.6)
+
+DISTRICT_NAMES = [
+    "Anantnag","Bandipora","Baramulla","Budgam","Ganderbal","Kupwara",
+    "Pulwama","Shopian","Kulgam","Srinagar","Jammu","Udhampur","Kathua",
+    "Rajouri","Poonch","Reasi","Doda","Ramban","Kishtwar"
+]
+
+
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+USGS_EQ_URL = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson"
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+
+
+_cache_coords = {}
+_cache_weather = {}
+_cache_usgs = None
+_cache_safehouses = None
+
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    phi1, phi2 = radians(lat1), radians(lat2)
+    dphi = radians(lat2 - lat1)
+    dlambda = radians(lon2 - lon1)
+    a = sin(dphi/2)**2 + cos(phi1)*cos(phi2)*sin(dlambda/2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1-a))
+    return R * c
+
+
+@sleep_and_retry
+@limits(calls=1, period=1)
+def nominatim_lookup(query, country="India", extra_params=None):
+    params = {"q": query + ", Jammu and Kashmir, India", "format": "json", "limit": 1}
+    if extra_params:
+        params.update(extra_params)
+    headers = {"User-Agent": "JK-Evacuation-App/1.0 (email@example.com)"}
+    r = requests.get(NOMINATIM_URL, params=params, headers=headers, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    if not data:
+        return None
+    return {"lat": float(data[0]["lat"]), "lon": float(data[0]["lon"]), "display_name": data[0].get("display_name")}
+
+
+@sleep_and_retry
+@limits(calls=5, period=1)
+def fetch_precip_last_24h(lat, lon):
+    key = (round(lat,5), round(lon,5))
+    if key in _cache_weather:
+        return _cache_weather[key]
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": "precipitation",
+        "timezone": "UTC",
+        "past_days": 1
+    }
+    try:
+        r = requests.get(OPEN_METEO_URL, params=params, timeout=10)
+        r.raise_for_status()
+        j = r.json()
+        hourly = j.get("hourly", {}).get("precipitation", [])
+        total = sum(hourly) if isinstance(hourly, list) else 0.0
+        _cache_weather[key] = float(total)
+        return float(total)
+    except Exception:
+        _cache_weather[key] = 0.0
+        return 0.0
+
+
+def fetch_usgs_quakes():
+    global _cache_usgs
+    if _cache_usgs is not None:
+        return _cache_usgs
+    try:
+        r = requests.get(USGS_EQ_URL, timeout=10)
+        r.raise_for_status()
+        j = r.json()
+        feats = j.get("features", [])
+        quakes = []
+        for f in feats:
+            props = f.get("properties", {})
+            geom = f.get("geometry", {})
+            coords = geom.get("coordinates", [None, None])
+            quakes.append({
+                "mag": props.get("mag"),
+                "place": props.get("place"),
+                "time": props.get("time"),
+                "lon": coords[0],
+                "lat": coords[1]
+            })
+        _cache_usgs = quakes
+        return quakes
+    except Exception:
+        _cache_usgs = []
+        return []
+
+
+def estimate_eq_risk(lat, lon, radius_km=150):
+    quakes = fetch_usgs_quakes()
+    max_mag = 0.0
+    for q in quakes:
+        if q["lat"] is None or q["lon"] is None or q["mag"] is None:
+            continue
+        d = haversine_km(lat, lon, q["lat"], q["lon"])
+        if d <= radius_km and q["mag"] > max_mag:
+            max_mag = q["mag"]
+    return float(max_mag)
+
+
+@sleep_and_retry
+@limits(calls=1, period=1)
+def fetch_safehouses_overpass(bbox=JK_BBOX):
+    global _cache_safehouses
+    if _cache_safehouses is not None:
+        return _cache_safehouses
+
+    lat1, lon1, lat2, lon2 = bbox[0], bbox[1], bbox[2], bbox[3]
+
+    query = f"""
+    [out:json][timeout:60];
+    (
+      node["amenity"="shelter"]({lat1},{lon1},{lat2},{lon2});
+      node["emergency"="shelter"]({lat1},{lon1},{lat2},{lon2});
+      node["amenity"="hospital"]({lat1},{lon1},{lat2},{lon2});
+      node["amenity"="police"]({lat1},{lon1},{lat2},{lon2});
+      node["amenity"="fire_station"]({lat1},{lon1},{lat2},{lon2});
+      node["community_centre"]({lat1},{lon1},{lat2},{lon2});
+      way["amenity"="shelter"]({lat1},{lon1},{lat2},{lon2});
+      way["amenity"="hospital"]({lat1},{lon1},{lat2},{lon2});
+      way["amenity"="police"]({lat1},{lon1},{lat2},{lon2});
+      way["amenity"="fire_station"]({lat1},{lon1},{lat2},{lon2});
+    );
+    out center;
+    """
+    try:
+        r = requests.post(OVERPASS_URL, data={"data": query}, timeout=60)
+        r.raise_for_status()
+        j = r.json()
+        elements = j.get("elements", [])
+        points = []
+        for el in elements:
+            lat = el.get("lat") or (el.get("center") or {}).get("lat")
+            lon = el.get("lon") or (el.get("center") or {}).get("lon")
+            tags = el.get("tags", {}) or {}
+            name = tags.get("name") or tags.get("ref") or tags.get("operator") or "Unknown"
+            typ = tags.get("amenity") or tags.get("emergency") or tags.get("community_type") or "shelter"
+            points.append({"name": name, "lat": float(lat), "lon": float(lon), "type": typ})
+
+        dedup = []
+        for p in points:
+            merged = False
+            for q in dedup:
+                if haversine_km(p["lat"], p["lon"], q["lat"], q["lon"]) < 0.25:
+
+                    if p["name"] not in q["aliases"]:
+                        q["aliases"].append(p["name"])
+                    merged = True
+                    break
+            if not merged:
+                dedup.append({"name": p["name"], "aliases":[p["name"]], "lat": p["lat"], "lon": p["lon"], "type": p["type"]})
+
+        safehouses = []
+        for d in dedup:
+            safehouses.append({"name": d["name"], "aliases": d["aliases"], "lat": d["lat"], "lon": d["lon"], "type": d["type"], "capacity": None})
+        _cache_safehouses = safehouses
+        return safehouses
+    except Exception as e:
+
+        fallback = [
+            {"name":"Safehouse Srinagar A","aliases":["Srinagar Safehouse"],"lat":34.0850,"lon":74.8000,"type":"shelter","capacity":200},
+            {"name":"Safehouse Baramulla East","aliases":["Baramulla Safehouse"],"lat":34.2105,"lon":74.3490,"type":"shelter","capacity":150},
+            {"name":"Safehouse Anantnag Central","aliases":["Anantnag Safehouse"],"lat":33.7335,"lon":75.1500,"type":"shelter","capacity":180},
+        ]
+        _cache_safehouses = fallback
+        return fallback
+
+
+FALLBACK_COORDS = {
+    "Anantnag": (33.7327, 75.1487),
+    "Bandipora": (34.4173, 74.6430),
+    "Baramulla": (34.2095, 74.3482),
+    "Budgam": (34.0159, 74.7644),
+    "Ganderbal": (34.2294, 74.7748),
+    "Kupwara": (34.5265, 74.2546),
+    "Pulwama": (33.8740, 74.8994),
+    "Shopian": (33.7171, 74.8346),
+    "Kulgam": (33.6390, 75.0194),
+    "Srinagar": (34.0837, 74.7973),
+    "Jammu": (32.7266, 74.8570),
+    "Udhampur": (32.9244, 75.1357),
+    "Kathua": (32.3690, 75.5250),
+    "Rajouri": (33.3720, 74.3152),
+    "Poonch": (33.7730, 74.0923),
+    "Reasi": (33.0899, 74.8293),
+    "Doda": (33.1453, 75.5456),
+    "Ramban": (33.2425, 75.2441),
+    "Kishtwar": (33.3139, 75.7652)
+}
+
+def get_district_centers(district_names=DISTRICT_NAMES):
+    positions = {}
+    for name in district_names:
+        if name in _cache_coords:
+            positions[name] = _cache_coords[name]
+            continue
+        try:
+            res = nominatim_lookup(name)
+            if res:
+                _cache_coords[name] = (res["lat"], res["lon"])
+                positions[name] = _cache_coords[name]
+            else:
+
+                if name in FALLBACK_COORDS:
+                    positions[name] = FALLBACK_COORDS[name]
+                else:
+                    positions[name] = (None, None)
+        except Exception:
+            if name in FALLBACK_COORDS:
+                positions[name] = FALLBACK_COORDS[name]
+            else:
+                positions[name] = (None, None)
+    return positions
+
+
+def build_district_graph(district_names=DISTRICT_NAMES):
+    positions = get_district_centers(district_names)
+    G = nx.Graph()
+    for d in district_names:
+        lat, lon = positions.get(d, (None, None))
+        if lat is None:
+            continue
+
+        G.add_node(d, lat=float(lat), lon=float(lon), precipitation_24h=0.0, quake_mag=0.0, disaster_type="None", blocked=False)
+    nodes = list(G.nodes)
+    for i in range(len(nodes)):
+        for j in range(i+1, len(nodes)):
+            a = nodes[i]; b = nodes[j]
+            la, lo = G.nodes[a]["lat"], G.nodes[a]["lon"]
+            lb, lo2 = G.nodes[b]["lat"], G.nodes[b]["lon"]
+            dkm = haversine_km(la, lo, lb, lo2)
+            G.add_edge(a, b, weight=float(dkm))
+    return G, positions
+
+
+def enrich_graph_with_live_data(G):
+    for n, data in G.nodes(data=True):
+        lat, lon = data["lat"], data["lon"]
+
+        try:
+            p24 = fetch_precip_last_24h(lat, lon)
+        except Exception:
+            p24 = 0.0
+
+        try:
+            mag = estimate_eq_risk(lat, lon, radius_km=150)
+        except Exception:
+            mag = 0.0
+
+        G.nodes[n]["precipitation_24h"] = float(p24)
+        G.nodes[n]["quake_mag"] = float(mag)
+
+        G.nodes[n]["blocked"] = G.nodes[n].get("blocked", False) or (p24 >= 200)
+    return G
+
+
+def district_risk_score(node_attrs):
+    score = 0.0
+    p = float(node_attrs.get("precipitation_24h", 0.0))
+    mag = float(node_attrs.get("quake_mag", 0.0))
+    dtype = str(node_attrs.get("disaster_type", "")).lower()
+
+    if p >= 200: score += 30
+    elif p >= 100: score += 18
+    elif p >= 50: score += 8
+    elif p >= 20: score += 3
+
+    if mag >= 6: score += 30
+    elif mag >= 5: score += 18
+    elif mag >= 4: score += 8
+
+    if "flood" in dtype: score *= 1.2
+    if "landslide" in dtype: score *= 1.1
+    return float(score)
+
+
+def get_safe_graph(G, blocked_disaster_types=None, remove_blocked_nodes=True, start=None, end=None):
+    if blocked_disaster_types is None:
+        blocked_disaster_types = []
+    H = G.copy()
+
+    if remove_blocked_nodes:
+        for n, d in list(H.nodes(data=True)):
+            if d.get("blocked", False) and n not in [start, end]:
+                H.remove_node(n)
+
+    for u, v, d in H.edges(data=True):
+        ru = district_risk_score(H.nodes[u])
+        rv = district_risk_score(H.nodes[v])
+        penalty = 0.0
+
+        if H.nodes[u].get("disaster_type", "") in blocked_disaster_types:
+            penalty += 25
+        if H.nodes[v].get("disaster_type", "") in blocked_disaster_types:
+            penalty += 25
+        d["weight"] = float(d.get("weight", 0.0) + 0.1*ru + 0.1*rv + penalty)
+    return H
+
+
+def find_routes(G, start, end, k=3):
+    routes = []
+    if start not in G or end not in G:
+        return routes
+    try:
+        paths = nx.shortest_simple_paths(G, start, end, weight="weight")
+        for p in paths:
+            cost = float(nx.path_weight(G, p, weight="weight"))
+            risk = sum(1 for n in p if district_risk_score(G.nodes[n]) > 5.0)
+            routes.append({"path": p, "cost": round(cost,2), "risk": int(risk)})
+            if len(routes) >= k:
+                break
+    except Exception:
+        pass
+    return routes
+
+
+def route_to_latlon(route, positions):
+    coords = []
+    for i in range(len(route)-1):
+        a, b = route[i], route[i+1]
+        coords.append((positions[a][0], positions[a][1]))
+        coords.append((positions[b][0], positions[b][1]))
+
+    out = []
+    for c in coords:
+        if not out or out[-1] != c:
+            out.append(c)
+    return out
+
+
+def top_k_safehouses(lat, lon, k=3):
+    shlist = fetch_safehouses_overpass(JK_BBOX)
+
+    ranked = []
+    for s in shlist:
+        d = haversine_km(lat, lon, s["lat"], s["lon"])
+        ranked.append({"safehouse": s, "distance_km": d})
+    ranked.sort(key=lambda x: x["distance_km"])
+    return ranked[:k]
+
+
+def build_map_html(evac_coords, start, end, positions, safehouse_entries):
+    center = positions.get(start, evac_coords[0] if evac_coords else (34.08, 74.8))
+    m = folium.Map(location=center, zoom_start=8, control_scale=True)
+
+
+    for d,(la,lo) in positions.items():
+        color = "blue"
+        if d == start: color = "green"
+        if d == end: color = "purple"
+        folium.CircleMarker([la,lo], radius=5, color=color, fill=True, tooltip=d).add_to(m)
+
+
+    if evac_coords:
+        folium.PolyLine(evac_coords, color="green", weight=6, opacity=0.8, tooltip="Evacuation Route").add_to(m)
+
+
+    for entry in safehouse_entries:
+        sh = entry["safehouse"]
+        route = entry.get("route_coords", [])
+        dist = entry.get("distance_km", None)
+        tooltip = f"{sh.get('name','Unknown')} ({sh.get('type','')})<br>Distance: {dist:.2f} km"
+        folium.Marker([sh["lat"], sh["lon"]], tooltip=tooltip, icon=folium.Icon(color="red", icon="home")).add_to(m)
+        if route:
+            folium.PolyLine(route, color="blue", weight=4, opacity=0.8, tooltip=f"To {sh.get('name','')}" ).add_to(m)
+
+
+    info_html = "<div style='font-family:Arial,sans-serif; font-size:14px'>"
+    info_html += f"<b>Top safehouses near {end}:</b><br>"
+    for i,entry in enumerate(safehouse_entries, start=1):
+        s = entry["safehouse"]
+        info_html += f"{i}. <b>{s.get('name')}</b> ({s.get('type')}) — {entry.get('distance_km'):.2f} km<br>"
+    info_html += "</div>"
+
+
+    folium.map.Marker(
+        location=[center[0], center[1]],
+        icon=folium.DivIcon(html=f"""<div style="position: fixed; left: 10px; top: 10px; z-index:9999; background:white; padding:8px; border-radius:6px; box-shadow:0 1px 4px rgba(0,0,0,0.3)">{info_html}</div>""")
+    ).add_to(m)
+
+    rendered = m.get_root().render()
+    iframe = f'<iframe srcdoc="{rendered.replace('"', '&quot;')}" style="width:100%; height:700px; border:none;"></iframe>'
+    return iframe
+
+
+def compute_and_render(start, end, k_safehouses=3, blocked_disaster_types=None):
+    if blocked_disaster_types is None:
+        blocked_disaster_types = []
+
+    G, positions = build_district_graph(DISTRICT_NAMES)
+
+    G = enrich_graph_with_live_data(G)
+
+
+    H = get_safe_graph(G, blocked_disaster_types, remove_blocked_nodes=False, start=start, end=end)
+
+    routes = find_routes(H, start, end, k=3)
+    if not routes:
+
+        H2 = get_safe_graph(G, blocked_disaster_types, remove_blocked_nodes=False, start=start, end=end)
+        routes = find_routes(H2, start, end, k=1)
+        if not routes:
+            return "No evacuation route found (all paths blocked or disconnected).", "<p>No map</p>"
+
+    chosen = routes[0]["path"]
+    evac_coords = route_to_latlon(chosen, positions)
+
+    lat_end, lon_end = positions[end]
+    top_sh = top_k_safehouses(lat_end, lon_end, k=k_safehouses)
+    safehouse_entries = []
+    for entry in top_sh:
+        sh = entry["safehouse"]
+
+        route_coords = [(lat_end, lon_end), (sh["lat"], sh["lon"])]
+        safehouse_entries.append({"safehouse": sh, "distance_km": entry["distance_km"], "route_coords": route_coords})
+
+
+    map_html = build_map_html(evac_coords, start, end, positions, safehouse_entries)
+
+    summary = {
+        "route_districts": " → ".join(chosen),
+        "route_cost": routes[0]["cost"],
+        "route_risk": routes[0]["risk"],
+        "top_safehouses": [
+            {"name": e["safehouse"]["name"], "distance_km": round(e["distance_km"],2), "type": e["safehouse"].get("type")}
+            for e in safehouse_entries
+        ]
+    }
+    return json.dumps(summary, indent=2), map_html
+
+
+_positions = get_district_centers(DISTRICT_NAMES)
+valid_districts = sorted([d for d,v in _positions.items() if v[0] is not None])
+
+with gr.Blocks(title="J&K Evacuation (Real External APIs, Option C)") as demo:
+    gr.Markdown("# 🚨 J&K Evacuation Routing — ")
+    with gr.Row():
+        start_dd = gr.Dropdown(label="📍 Start District", choices=valid_districts, value=valid_districts[0])
+        end_dd = gr.Dropdown(label="🏁 Destination District", choices=valid_districts, value=valid_districts[1] if len(valid_districts)>1 else valid_districts[0])
+    with gr.Row():
+        chk_blocked = gr.CheckboxGroup(label="Treat these disaster types as blocked (penalty)", choices=["flood","landslide","earthquake"], value=[])
+        k_safe = gr.Slider(minimum=1, maximum=5, step=1, value=3, label="Top k safehouses to show")
+    run_btn = gr.Button("🧭 Find Evacuation Route")
+    out_summary = gr.Textbox(label="Route Summary (JSON)", lines=8)
+    out_map = gr.HTML(label="Evacuation Map")
+
+    def ui_action(start, end, blocked, k):
+        txt, html = compute_and_render(start, end, k_safehouses=int(k), blocked_disaster_types=blocked)
+        return txt, html
+
+    run_btn.click(ui_action, inputs=[start_dd, end_dd, chk_blocked, k_safe], outputs=[out_summary, out_map])
+
+demo.launch(share=True)
